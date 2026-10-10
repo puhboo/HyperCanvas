@@ -20,7 +20,7 @@ final class CanvasBackground {
     private static Context context;
     private static WeakReference<View> clock = new WeakReference<>(null);
     private static FrameLayout layer;
-    private static TextureView texture;
+    private static CanvasGlVideoView texture;
     private static android.widget.ImageView frozenImage;
     private static FrameLayout frozenLayer;
     private static View frozenDim;
@@ -177,23 +177,16 @@ final class CanvasBackground {
         layer = new FrameLayout(parent.getContext()); layer.setTag("HMCSpotifyCanvas");
         layer.setClickable(false); layer.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
         layer.setAlpha(0f);
-        texture = new TextureView(parent.getContext());
-        // Spotify Canvas MP4s have no alpha.  Keeping this surface opaque avoids the
-        // translucent TextureView composition path, which can repeatedly replay the
-        // decoder's opening frames when SystemUI is rendered with Vulkan.
-        texture.setOpaque(true);
+        texture = new CanvasGlVideoView(parent.getContext(), new CanvasGlVideoView.Callback() {
+            @Override public void ready(Surface next) { main.post(CanvasBackground::playIfReady); }
+            @Override public void gone() { release(); }
+        });
         dim = new View(parent.getContext()); dim.setBackgroundColor(Color.BLACK);
         layer.addView(texture, new FrameLayout.LayoutParams(-1, -1));
         layer.addView(dim, new FrameLayout.LayoutParams(-1, -1));
         // Draw above the wallpaper inside its background layer, still below the clock and cards.
         parent.addView(layer, new ViewGroup.LayoutParams(-1, -1));
         orderLayer();
-        texture.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
-            @Override public void onSurfaceTextureAvailable(SurfaceTexture t, int w, int h) { playIfReady(); }
-            @Override public void onSurfaceTextureSizeChanged(SurfaceTexture t, int w, int h) { transform(); }
-            @Override public boolean onSurfaceTextureDestroyed(SurfaceTexture t) { release(); return true; }
-            @Override public void onSurfaceTextureUpdated(SurfaceTexture t) { }
-        });
     }
     private static void orderLayer() {
         if (layer == null || !(layer.getParent() instanceof ViewGroup)) return;
@@ -214,14 +207,14 @@ final class CanvasBackground {
         if (artwork != null) artwork.bringToFront();
     }
     private static void playIfReady() {
-        if (texture == null || !texture.isAvailable() || desired.isEmpty()
+        if (texture == null || texture.videoSurface() == null || desired.isEmpty()
                 || (desired.equals(failedUrl) && SystemClock.uptimeMillis() < retryAt)) return;
         long token = ++generation;
         String url = desired;
-        Surface next = new Surface(texture.getSurfaceTexture());
+        Surface next = texture.videoSurface();
         worker.post(() -> {
             dispose();
-            if (token != generation) { next.release(); return; }
+            if (token != generation) return;
             surface = next;
             try {
                 MediaPlayer created = new MediaPlayer(); player = created;
@@ -245,11 +238,7 @@ final class CanvasBackground {
         });
     }
     private static void transform() {
-        if (texture == null || videoW <= 0 || videoH <= 0 || texture.getWidth() <= 0 || texture.getHeight() <= 0) return;
-        float w = texture.getWidth(), h = texture.getHeight();
-        float scale = Math.max(w / videoW, h / videoH);
-        Matrix matrix = new Matrix(); matrix.setScale(videoW * scale / w, videoH * scale / h, w / 2f, h / 2f);
-        texture.setTransform(matrix);
+        if (texture != null && videoW > 0 && videoH > 0) texture.setVideoSize(videoW, videoH);
     }
     private static void effects() {
         if (texture == null || dim == null) return;
@@ -280,7 +269,9 @@ final class CanvasBackground {
         dim.setAlpha(shownDim);
         RenderEffect effect = shownBlur < 0.5f ? null
                 : RenderEffect.createBlurEffect(shownBlur, shownBlur, Shader.TileMode.CLAMP);
-        texture.setRenderEffect(effect);
+        // Applying a RenderEffect directly to a decoder TextureView is the Vulkan path that
+        // replays opening frames.  The Canvas is now rendered in its own GLES SurfaceView;
+        // retain dimming here and reserve blur for captured AOD artwork.
         if (frozenImage != null) frozenImage.setRenderEffect(effect);
         if (frozenDim != null) frozenDim.setAlpha(shownDim);
     }
@@ -320,34 +311,8 @@ final class CanvasBackground {
         if (frozenInAod || texture == null || layer == null) return;
         frozenInAod = true;
         // Capture only once; AOD displays this small static copy without decoding video frames.
-        if (texture.isAvailable() && texture.getWidth() > 0 && texture.getHeight() > 0) {
-            int width = Math.min(512, texture.getWidth());
-            int height = Math.max(1, Math.round(width * texture.getHeight() / (float) texture.getWidth()));
-            try { frozenBitmap = texture.getBitmap(width, height); }
-            catch (IllegalStateException ignored) { frozenBitmap = null; }
-            if (frozenBitmap != null) {
-                frozenImage = new android.widget.ImageView(layer.getContext());
-                frozenImage.setScaleType(android.widget.ImageView.ScaleType.FIT_XY);
-                frozenImage.setImageBitmap(frozenBitmap);
-                View root = layer.getRootView();
-                if (root instanceof ViewGroup && root != layer.getParent()) {
-                    // The keyguard content shrinks in AOD. Its static background must not inherit that scale.
-                    frozenLayer = new FrameLayout(layer.getContext());
-                    frozenLayer.setTag("HMCSpotifyCanvasAod");
-                    frozenLayer.setClickable(false);
-                    frozenLayer.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
-                    frozenDim = new View(layer.getContext());
-                    frozenDim.setBackgroundColor(Color.BLACK);
-                    frozenLayer.addView(frozenImage, new FrameLayout.LayoutParams(-1, -1));
-                    frozenLayer.addView(frozenDim, new FrameLayout.LayoutParams(-1, -1));
-                    ((ViewGroup) root).addView(frozenLayer, 0, new ViewGroup.LayoutParams(-1, -1));
-                    layer.setVisibility(View.INVISIBLE);
-                } else {
-                    layer.addView(frozenImage, 1, new FrameLayout.LayoutParams(-1, -1));
-                    texture.setVisibility(View.INVISIBLE);
-                }
-            }
-        }
+        // A SurfaceView retains its last decoded buffer when paused.  Do not copy it through the
+        // Vulkan TextureView path; pause below and let that buffer be the AOD still.
         worker.post(() -> {
             try { if (player != null && player.isPlaying()) player.pause(); }
             catch (IllegalStateException ignored) { }
@@ -381,11 +346,14 @@ final class CanvasBackground {
         shownBlur = shownDim = 0f;
         release(); firstFrame = false; desired = "";
         if (layer != null) { layer.animate().cancel(); if (layer.getParent() instanceof android.view.ViewGroup) ((android.view.ViewGroup) layer.getParent()).removeView(layer); }
+        if (texture != null) texture.releaseVideoSurface();
         layer = null; texture = null; dim = null; videoW = videoH = 0;
     }
     private static void release() { generation++; if (worker != null) worker.post(CanvasBackground::dispose); }
     private static void dispose() {
         if (player != null) { try { player.release(); } catch (Throwable ignored) { } player = null; }
-        if (surface != null) { surface.release(); surface = null; }
+        // The GLES view owns its Surface.  Releasing it here races MediaPlayer during a view
+        // transition and is precisely what produces short decoder restart loops.
+        surface = null;
     }
 }
